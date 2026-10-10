@@ -8,6 +8,7 @@ from kernels import (
     gemm_tuned as gemm_kernel,
     gemm_res_rms_tuned as gemm_res_rms_kernel,
     rms_norm_kernel,
+    finish_gemm_CE_kernel,
     gemm_CE_tuned as gemm_CE_kernel
 )
 
@@ -42,7 +43,7 @@ class GemmResRmsGemm(torch.autograd.Function):
             assert tensor.device == x.device and tensor.dtype == x.dtype
     
         o1 = torch.empty((B, M, K), device=x.device, dtype=x.dtype)
-        h0 = torch.empty_like(o1)
+        h0 = o1
         partial = torch.empty((B, M, R), device=x.device, dtype=torch.float32)
         
         gemm_res_rms_kernel[lambda meta: (triton.cdiv(M, meta["M_TILE_SIZE"]) * triton.cdiv(K, meta["K_TILE_SIZE"]), B)](
@@ -52,6 +53,7 @@ class GemmResRmsGemm(torch.autograd.Function):
             o1.stride(0), o1.stride(1),
             partial.stride(0), partial.stride(1),
             M, N, K,
+            STORE_H0=False,
         )
 
         R = partial.shape[-1]
@@ -84,29 +86,30 @@ class GemmResRmsGemm(torch.autograd.Function):
             M, K, K2,
         )
 
-        ctx.save_for_backward(x, weight1, z, gamma, weight2, reduced_partial, h0, o1, o2, o3)
+        ctx.save_for_backward(x, weight1, z, gamma, weight2, reduced_partial, o1, o2, o3)
 
         return o3
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, weight1, z, gamma, weight2, reduced_partial, h0, h1, h2, y = ctx.saved_tensors
+        x, weight1, z, gamma, weight2, reduced_partial, h1, h2, y = ctx.saved_tensors
 
         grad_output = grad_output.contiguous()
-        s_hat = (grad_output.float() * y.float()).sum(dim=-1, keepdim=True) / h1.shape[-1]
         grad_h2 = grad_output @ weight2.T
-        if x.dtype != torch.float32:
+        if x.dtype == torch.float32:
+            s_hat = (grad_output.float() * y.float()).sum(dim=-1, keepdim=True) / h1.shape[-1]
+        else:
             s_hat = (grad_h2.float() * gamma.float() * h1.float() * reduced_partial).sum(-1, keepdim=True) / h1.shape[-1]
         grad_weight2 = h2.flatten(0, 1).T @ grad_output.flatten(0, 1)
         grad_h1 = (reduced_partial * (grad_h2.float() * gamma.float() - reduced_partial * h1.float() * s_hat)).to(x.dtype)
-        grad_h0 = torch.clone(grad_h1)
+        grad_h0 = grad_h1
         grad_gamma = torch.sum(grad_h2.float() * h1.float() * reduced_partial, dim=(0, 1)).to(gamma.dtype)
 
         grad_x = grad_h0 @ weight1.T
         grad_weight1 = x.flatten(0, 1).T @ grad_h0.flatten(0, 1)
 
 
-        return (grad_x, grad_weight1, torch.clone(grad_h1), grad_gamma, grad_weight2, None)[:len(ctx.needs_input_grad)]
+        return (grad_x, grad_weight1, grad_h1, grad_gamma, grad_weight2, None)[:len(ctx.needs_input_grad)]
 
 
 class GemmResRmsGemm2(torch.autograd.Function):
@@ -139,7 +142,7 @@ class GemmResRmsGemm2(torch.autograd.Function):
             assert tensor.device == x.device and tensor.dtype == x.dtype
     
         o1 = torch.empty((B, M, K), device=x.device, dtype=x.dtype)
-        h0 = torch.empty_like(o1)
+        h0 = o1
         partial = torch.empty((B, M, R), device=x.device, dtype=torch.float32)
         
         gemm_res_rms_kernel[lambda meta: (triton.cdiv(M, meta["M_TILE_SIZE"]) * triton.cdiv(K, meta["K_TILE_SIZE"]), B)](
@@ -149,6 +152,7 @@ class GemmResRmsGemm2(torch.autograd.Function):
             o1.stride(0), o1.stride(1),
             partial.stride(0), partial.stride(1),
             M, N, K,
+            STORE_H0=False,
         )
 
         R = partial.shape[-1]
@@ -193,11 +197,12 @@ class GemmResRmsGemm2(torch.autograd.Function):
 
         x, weight1, gamma, weight2, reduced_partial, h1, h2, y = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        s_hat = (grad_output.float() * y.float()).sum(dim=-1, keepdim=True) / h1.shape[-1]
-        if x.dtype != torch.float32:
+        if x.dtype == torch.float32:
+            s_hat = (grad_output.float() * y.float()).sum(dim=-1, keepdim=True) / h1.shape[-1]
+        else:
             grad_h2 = grad_output @ weight2.T
             s_hat = (grad_h2.float() * gamma.float() * h1.float() * reduced_partial).sum(-1, keepdim=True) / h1.shape[-1]
-        weight2 = weight2.T.contiguous()
+        weight2 = weight2.T.contiguous() if x.dtype == torch.float32 else weight2.T
 
         B, M, N = grad_output.shape
         N2, K = weight2.shape
@@ -311,8 +316,8 @@ class GemmRope(torch.autograd.Function):
         )
 
         grad_x = grad_h0 @ weight.T
-        grad_weight = torch.sum(x.transpose(2, 1) @ grad_h0, dim=0)
-        grad_weight2 = torch.sum(o.transpose(2, 1) @ grad_output, dim=0)
+        grad_weight = x.flatten(0, 1).T @ grad_h0.flatten(0, 1)
+        grad_weight2 = o.flatten(0, 1).T @ grad_output.flatten(0, 1)
 
         gradients = (grad_x, grad_weight, None, None, grad_weight2, None, None)
         return gradients[:len(ctx.needs_input_grad)]
@@ -342,26 +347,24 @@ class GemmCE(torch.autograd.Function):
         cross_entropy = torch.empty((B, M), device=x.device, dtype=torch.float32)
         logsumexp = torch.empty_like(cross_entropy)
 
-        one_hot = torch.nn.functional.one_hot(y, K)
-
-        gemm_CE_kernel[lambda meta: (B, triton.cdiv(M, meta["M_TILE_SIZE"]))](
-            x, weight1, one_hot, cross_entropy, logsumexp,
-            x.stride(0), x.stride(1),
-            weight1.stride(0),
-            one_hot.stride(0), one_hot.stride(1),
-            logsumexp.stride(0),
-            M, N, K,
+        assert y.dtype == torch.long and y.is_contiguous()
+        assert x.dtype == weight1.dtype
+        tiles = triton.cdiv(K, 128)
+        logits = torch.empty((B, M, K), device=x.device, dtype=x.dtype)
+        maximum = torch.empty((B, M, tiles), device=x.device, dtype=torch.float32)
+        total, target = torch.empty_like(maximum), torch.empty_like(maximum)
+        gemm_CE_kernel[lambda meta: (triton.cdiv(M, meta["M_TILE_SIZE"]) * tiles, B)](
+            x, weight1, y, logits, maximum, total, target, M, N, K,
         )
-
-        ctx.save_for_backward(x, weight1, logsumexp, one_hot)
-
+        finish_gemm_CE_kernel[(B * M,)](maximum, total, target, cross_entropy, logsumexp,
+                                    B * M, tiles, triton.next_power_of_2(tiles))
+        ctx.save_for_backward(x, weight1, logsumexp, logits, y)
         return cross_entropy
 
     @staticmethod
     def backward(ctx, grad):
-        x, weight1, logsumexp, one_hot = ctx.saved_tensors
-        P = x @ weight1
-        S = torch.exp(P - logsumexp[..., None])
-        d_logits_tile = ((S - one_hot) * grad[..., None]).to(x.dtype)
-
-        return d_logits_tile @ weight1.T, (x.transpose(2, 1) @ d_logits_tile).sum(dim=0), None
+        x, weight1, logsumexp, logits, labels = ctx.saved_tensors
+        probabilities = torch.exp(logits.float() - logsumexp[..., None])
+        probabilities.scatter_add_(-1, labels[..., None], -torch.ones_like(logsumexp[..., None]))
+        d_logits = (probabilities * grad[..., None]).to(x.dtype)
+        return d_logits @ weight1.T, x.flatten(0, 1).T @ d_logits.flatten(0, 1), None

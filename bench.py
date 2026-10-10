@@ -7,6 +7,10 @@ import pandas as pd
 import torch
 
 
+class _Mismatch(AssertionError):
+    pass
+
+
 def benchmark(functions, args, *, mode="fwd", warmup=10, repeats=30, trace_dir=None):
     if mode not in ("fwd", "bwd", "fwd+bwd") or repeats < 1 or warmup < 0:
         raise ValueError("Invalid mode, warmup or repeats")
@@ -14,6 +18,12 @@ def benchmark(functions, args, *, mode="fwd", warmup=10, repeats=30, trace_dir=N
     device, dtype = args[0].device, args[0].dtype
     cuda = device.type == "cuda"
     atol, rtol = (1e-5, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    def close(actual, expected):
+        try:
+            torch.testing.assert_close(actual.float(), expected.float(), atol=atol, rtol=rtol)
+        except AssertionError as error:
+            raise _Mismatch(str(error)) from error
+
     forward_args = tuple(x.detach() if isinstance(x, torch.Tensor) else x for x in args)
     reference = functions[0][1]
     expected = reference(*args)
@@ -34,16 +44,32 @@ def benchmark(functions, args, *, mode="fwd", warmup=10, repeats=30, trace_dir=N
         try:
             if mode not in getattr(fn, "modes", ("fwd", "bwd", "fwd+bwd")):
                 raise NotImplementedError("Forward only")
-            output = fn(*args) if mode != "fwd" else fn(*forward_args)
-            row["output_max_abs"] = (output.float() - expected.float()).abs().max().item()
-            row["output_fp32_max_abs"] = (output.float() - fp32_output).abs().max().item()
-            torch.testing.assert_close(output.float(), expected.float(), atol=atol, rtol=rtol)
-            if mode != "fwd":
-                grads = torch.autograd.grad(output, inputs, upstream.clone())
-                row["grad_max_abs"] = max((g.float() - r.float()).abs().max().item() for g, r in zip(grads, expected_grads))
-                row["grad_fp32_max_abs"] = max((g.float() - r).abs().max().item() for g, r in zip(grads, fp32_grads))
-                for grad, ref in zip(grads, expected_grads):
-                    torch.testing.assert_close(grad.float(), ref.float(), atol=atol, rtol=rtol)
+            def check(candidate):
+                with torch.set_grad_enabled(mode != "fwd"):
+                    output = candidate(*args) if mode != "fwd" else candidate(*forward_args)
+                close(output, expected)
+                row["output_fp32_max_abs"] = (output.float() - fp32_output).abs().max().item()
+                if mode != "fwd":
+                    grads = torch.autograd.grad(output, inputs, upstream.clone())
+                    for grad, ref in zip(grads, expected_grads):
+                        close(grad, ref)
+                    row["grad_fp32_max_abs"] = max((g.float() - r).abs().max().item() for g, r in zip(grads, fp32_grads))
+
+            eager = fn
+            candidate = getattr(fn, "compiled", None)
+            if candidate is not None:
+                try:
+                    check(candidate)
+                except (_Mismatch, torch.cuda.OutOfMemoryError):
+                    raise
+                except Exception as error:
+                    row["compile_fallback"] = f"{type(error).__name__}: {str(error).strip().splitlines()[0] if str(error).strip() else ''}"
+                    check(eager)
+                else:
+                    fn = candidate
+                    row["implementation"] = name + " + torch.compile"
+            else:
+                check(fn)
 
             @torch.no_grad()
             def forward():
@@ -78,7 +104,7 @@ def benchmark(functions, args, *, mode="fwd", warmup=10, repeats=30, trace_dir=N
                     samples.append((time.perf_counter() - start) * 1000)
             row.update(mean_ms=statistics.mean(samples), std_ms=statistics.stdev(samples) if repeats > 1 else 0,
                        median_ms=statistics.median(samples))
-            row["tiles"] = getattr(fn, "configs", lambda: "")()
+            row["tiles"] = getattr(eager, "configs", lambda: "")()
             if trace_dir is not None and name == functions[-1][0]:
                 run = prepare()
                 activities = [torch.profiler.ProfilerActivity.CPU]
@@ -93,12 +119,12 @@ def benchmark(functions, args, *, mode="fwd", warmup=10, repeats=30, trace_dir=N
                 folder.mkdir(parents=True, exist_ok=True)
                 profiler.export_chrome_trace(str(folder / (re.sub(r"[^\w.-]", "_", f"{name}_{mode}") + ".json")))
         except Exception as error:
-            row.update(status="incorrect" if isinstance(error, AssertionError) else "unsupported"
+            row.update(status="incorrect" if isinstance(error, _Mismatch) else "unsupported"
                        if isinstance(error, (ImportError, NotImplementedError)) else "error",
                        reason=f"{type(error).__name__}: {error}", mean_ms=float("nan"), std_ms=float("nan"), median_ms=float("nan"))
         rows.append(row)
     result = pd.DataFrame(rows)
     result["speedup_baseline"] = result.mean_ms.iloc[0] / result.mean_ms
-    compiled = result[result.implementation.str.contains("torch.compile", regex=False)]
+    compiled = result[result.implementation.isin(("cuBLAS + torch.compile", "PyTorch + torch.compile (baseline)"))]
     result["speedup_compile"] = (compiled.mean_ms.iloc[0] if len(compiled) else float("nan")) / result.mean_ms
     return result

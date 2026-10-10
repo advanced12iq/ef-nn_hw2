@@ -47,7 +47,7 @@ def gemm_kernel(
         a = tl.load(x_ptr + x_new_offsets, x_mask, other=0)
         b = tl.load(b_ptr + b_new_offsets, b_mask, other=0)
 
-        acc += tl.dot(a, b, input_precision="ieee")
+        acc = tl.dot(a, b, acc, input_precision="ieee")
 
     o_mask = (r < m_dim) & (c < k_dim)
 
@@ -88,6 +88,7 @@ def gemm_res_rms_kernel(
     M_TILE_SIZE: tl.constexpr, 
     N_TILE_SIZE: tl.constexpr, 
     K_TILE_SIZE: tl.constexpr,
+    STORE_H0: tl.constexpr = True,
 ):
     batch = tl.program_id(1)
     mk = tl.program_id(0)   # up to 16
@@ -114,7 +115,7 @@ def gemm_res_rms_kernel(
         a = tl.load(x_ptr + x_new_offsets, x_mask, other=0)
         b = tl.load(b_ptr + b_new_offsets, b_mask, other=0)
 
-        acc += tl.dot(a, b, input_precision="ieee")
+        acc = tl.dot(a, b, acc, input_precision="ieee")
 
 
     o_mask = (r < m_dim) & (c < k_dim)
@@ -122,7 +123,8 @@ def gemm_res_rms_kernel(
 
     res = tl.load(res_ptr + o_offset, o_mask, other=0)
 
-    tl.store(h0_ptr + o_offset, acc, o_mask)
+    if STORE_H0:
+        tl.store(h0_ptr + o_offset, acc, o_mask)
     acc = (acc.to(o_ptr.dtype.element_ty).to(tl.float32) + res.to(tl.float32)).to(o_ptr.dtype.element_ty).to(tl.float32)
 
     partial = tl.where(o_mask, acc, 0.0)
@@ -215,7 +217,7 @@ def backward_gemm_rms_res_kernel(
             grad = tl.load(grad_o_ptr + grad_new_offset, mask=(grad_r < m_dim) & (n_offset[None, :] < n_dim), other=0)
             weight = tl.load(weight2_ptr + weight_new_offset, mask=(weight_c < k_dim) & (n_offset[:, None] < n_dim), other=0)
     
-            acc += tl.dot(grad, weight, input_precision="ieee")
+            acc = tl.dot(grad, weight, acc, input_precision="ieee")
 
     m_offset = m*M_TILE_SIZE+tl.arange(0, M_TILE_SIZE)[:, None]
 
@@ -279,7 +281,7 @@ def gemm_rope_kernel(
         a = tl.load(x_ptr + x_new_offsets, x_mask, other=0)
         b = tl.load(weight_ptr + weight_new_offsets, weight_mask, other=0)
 
-        acc += tl.dot(a, b, input_precision="ieee")
+        acc = tl.dot(a, b, acc, input_precision="ieee")
 
     acc = acc.to(o_ptr.dtype.element_ty).to(tl.float32)
     p = k * (K_TILE_SIZE // 2) + tl.arange(0, K_TILE_SIZE // 2)[None, :]
@@ -321,63 +323,49 @@ def gemm_rope_kernel(
 @_trace
 @triton.jit
 def gemm_CE_kernel(
-    x_ptr, weight_ptr, y_ptr, loss_ptr, logsumexp_ptr,
-    xb_stride, xm_stride,
-    weightn_stride,
-    yb_stride, ym_stride,
-    numb_stride,
+    x_ptr, weight_ptr, y_ptr, logits_ptr, max_ptr, sum_ptr, target_ptr,
     m_dim: tl.constexpr, n_dim: tl.constexpr, k_dim: tl.constexpr,
-    M_TILE_SIZE: tl.constexpr, 
-    N_TILE_SIZE: tl.constexpr, 
-    K_TILE_SIZE: tl.constexpr
+    M_TILE_SIZE: tl.constexpr, N_TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr,
 ):
-    batch = tl.program_id(0)
-    m = tl.program_id(1)
+    batch = tl.program_id(1)
+    tile = tl.program_id(0)
+    tiles = tl.cdiv(k_dim, K_TILE_SIZE)
+    r = (tile // tiles) * M_TILE_SIZE + tl.arange(0, M_TILE_SIZE)
+    c = (tile % tiles) * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+    acc = tl.zeros((M_TILE_SIZE, K_TILE_SIZE), tl.float32)
+    for i in tl.range(tl.cdiv(n_dim, N_TILE_SIZE)):
+        n = i * N_TILE_SIZE + tl.arange(0, N_TILE_SIZE)
+        a = tl.load(x_ptr + (batch * m_dim + r[:, None]) * n_dim + n[None, :],
+                    (r[:, None] < m_dim) & (n[None, :] < n_dim), other=0)
+        b = tl.load(weight_ptr + n[:, None] * k_dim + c[None, :],
+                    (n[:, None] < n_dim) & (c[None, :] < k_dim), other=0)
+        acc = tl.dot(a, b, acc, input_precision="ieee")
+    acc = acc.to(logits_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(logits_ptr + (batch * m_dim + r[:, None]) * k_dim + c[None, :], acc,
+             (r[:, None] < m_dim) & (c[None, :] < k_dim))
+    values = tl.where(c[None, :] < k_dim, acc, -float("inf"))
+    maximum = tl.max(values, 1)
+    total = tl.sum(tl.exp(values - maximum[:, None]), 1)
+    labels = tl.load(y_ptr + batch * m_dim + r, r < m_dim, other=-1)
+    target = tl.sum(tl.where(labels[:, None] == c[None, :], acc, 0.0), 1)
+    offset = (batch * m_dim + r) * tiles + tile % tiles
+    tl.store(max_ptr + offset, maximum, r < m_dim)
+    tl.store(sum_ptr + offset, total, r < m_dim)
+    tl.store(target_ptr + offset, target, r < m_dim)
 
-    r = m * M_TILE_SIZE + tl.arange(0, M_TILE_SIZE)[:, None]
-    x_offset = batch*xb_stride + r*xm_stride
 
-    max_logit = tl.full((M_TILE_SIZE,), -float("inf"), dtype=tl.float32)
-    sumexp = tl.zeros_like(max_logit).to(tl.float32)
-    desired_logit = tl.zeros_like(max_logit).to(tl.float32)
-
-    for k in tl.range(tl.cdiv(k_dim, K_TILE_SIZE)):
-        c = tl.arange(0, K_TILE_SIZE)[None, :] + K_TILE_SIZE * k
-        weight_offset = c
-        y_offset = batch*yb_stride + r*ym_stride + c
-
-        acc = tl.zeros((M_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
-
-        for i in tl.range(tl.cdiv(n_dim, N_TILE_SIZE)):
-            s = i * N_TILE_SIZE + tl.arange(0, N_TILE_SIZE)
-            x_new_offsets = x_offset + s[None, :]
-            weight_new_offsets = weight_offset + s[:, None]*weightn_stride
-
-            x_mask = (r < m_dim) & (s[None, :] < n_dim)
-            weight_mask = (s[:, None] < n_dim) & (c < k_dim)
-
-            a = tl.load(x_ptr + x_new_offsets, x_mask, other=0)
-            b = tl.load(weight_ptr + weight_new_offsets, weight_mask, other=0)
-
-            acc += tl.dot(a, b, input_precision="ieee")
-
-        acc = acc.to(x_ptr.dtype.element_ty).to(tl.float32)
-        acc = tl.where(c < k_dim, acc, -float("inf"))
-        new_max_logit = tl.maximum(max_logit, tl.max(acc, axis=-1))
-        P = acc - new_max_logit[:, None]
-        sumexp = tl.exp(max_logit - new_max_logit) * sumexp + tl.sum(tl.exp(P), axis=-1)
-
-        y = tl.load(y_ptr + y_offset, mask=(r < m_dim) & (c < k_dim), other=0)
-        desired_logit += tl.sum(tl.where(y != 0, acc, 0.0), axis=-1)
-        max_logit = new_max_logit
-
-    o_r = m * M_TILE_SIZE + tl.arange(0, M_TILE_SIZE)
-    output_offset = batch*numb_stride + o_r
-
-    logsumexp = tl.log(sumexp) + max_logit
-
-    tl.store(loss_ptr + output_offset, logsumexp - desired_logit, mask=o_r < m_dim)
-    tl.store(logsumexp_ptr + output_offset, logsumexp, mask=o_r < m_dim)
+@triton.jit
+def finish_gemm_CE_kernel(max_ptr, sum_ptr, target_ptr, loss_ptr, lse_ptr,
+                          ROWS: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    t = tl.arange(0, BLOCK)
+    maximum = tl.load(max_ptr + row * TILES + t, t < TILES, other=-float("inf"))
+    total = tl.load(sum_ptr + row * TILES + t, t < TILES, other=0)
+    target = tl.load(target_ptr + row * TILES + t, t < TILES, other=0)
+    peak = tl.max(maximum, 0)
+    lse = peak + tl.log(tl.sum(total * tl.exp(maximum - peak), 0))
+    tl.store(lse_ptr + row, lse)
+    tl.store(loss_ptr + row, lse - tl.sum(target, 0))
 
 
 
@@ -391,4 +379,4 @@ gemm_tuned = triton.autotune(configs=_gemm_configs, key=_key)(gemm_kernel)
 gemm_rope_tuned = triton.autotune(configs=_gemm_configs, key=_key)(gemm_rope_kernel)
 gemm_res_rms_tuned = triton.autotune(configs=[_config(64, 64, 128), _config(128, 64, 128, 8)], key=_key)(gemm_res_rms_kernel)
 backward_gemm_rms_res_tuned = triton.autotune(configs=[_config(64, 64, 128), _config(64, 128, 64)], key=_key)(backward_gemm_rms_res_kernel)
-gemm_CE_tuned = triton.autotune(configs=[_config(16, 64, 128), _config(32, 64, 128), _config(16, 64, 256, 8)], key=_key)(gemm_CE_kernel)
+gemm_CE_tuned = triton.autotune(configs=[_config(32, 64, 128), _config(64, 64, 128), _config(64, 128, 128, 8)], key=_key)(gemm_CE_kernel)

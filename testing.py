@@ -299,7 +299,7 @@ def liger_rms(x, w, z, gamma, w2, eps):
     return LigerRMSNormFunction.apply(x @ w + z, gamma, eps, 0.0, 'gemma', False, None) @ w2
 
 
-def liger_rope(x, w, cos, sin, w2):
+def liger_rope(x, w, cos, sin, w2, *, cache=None):
     import math
     from liger_kernel.ops.rope import LigerRopeFunction
     h = x @ w
@@ -307,9 +307,9 @@ def liger_rope(x, w, cos, sin, w2):
     H = math.gcd(K, 128)
     h = h.reshape(B, M, K // H, H)
     q = torch.cat((h[..., ::2], h[..., 1::2]), -1).transpose(1, 2).contiguous()
-    c, s = cos[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous(), sin[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous()
-    a, b = LigerRopeFunction.apply(q.clone(), q.clone(), c, s, None, 1)
-    h = ((a + b) * 0.5).transpose(1, 2)
+    c, s = cache if cache is not None else tuple(t[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous() for t in (cos, sin))
+    a, _ = LigerRopeFunction.apply(q, torch.zeros_like(q[:, :1]), c, s, None, 1)
+    h = a.transpose(1, 2)
     return torch.stack((h[..., :H // 2], h[..., H // 2:]), -1).reshape(B, M, K) @ w2
 
 
@@ -321,29 +321,80 @@ def liger_ce(x, w, labels):
     return (loss[0] if isinstance(loss, tuple) else loss).reshape(labels.shape)
 
 
-def flash_rope(x, w, cos, sin, w2):
+def liger_ce_unfused(x, w, labels):
+    from liger_kernel.ops.cross_entropy import LigerCrossEntropyFunction
+    logits = (x @ w).float().flatten(0, 1)
+    return LigerCrossEntropyFunction.apply(logits, labels.flatten(), None, -100, 0.0, 0.0, 'none')[0].reshape(labels.shape)
+
+
+def flashinfer_rms(x, w, z, gamma, w2, eps):
+    from flashinfer import rmsnorm
+    h = x @ w + z
+    return rmsnorm(h.flatten(0, 1), gamma, eps).reshape(h.shape) @ w2
+
+
+def flashinfer_rope(x, w, cos, sin, w2, *, cache=None):
     import math
-    from flash_attn.layers.rotary import apply_rotary_emb
+    from flashinfer.rope import apply_rope_with_cos_sin_cache
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError('FlashInfer RoPE requires FP16/BF16 inputs')
     h = x @ w
     B, M, K = h.shape
     H = math.gcd(K, 128)
-    h = apply_rotary_emb(h.reshape(B, M, K // H, H), cos[:, :H // 2].contiguous(),
-                         sin[:, :H // 2].contiguous(), interleaved=True)
-    return h.reshape(B, M, K) @ w2
+    if cache is None:
+        cache = (torch.arange(M, device=x.device).repeat(B),
+                 torch.cat((cos[:, :H // 2], sin[:, :H // 2]), -1).float().contiguous())
+    rotated, _ = apply_rope_with_cos_sin_cache(cache[0], h.flatten(0, 1),
+                                               torch.zeros((B * M, H), device=x.device, dtype=x.dtype),
+                                               H, cache[1], is_neox=False)
+    return rotated.reshape(B, M, K) @ w2
+
+
+def prepare_backend(fn, args):
+    from functools import partial
+    from importlib import import_module
+    modules = {coda_rms: 'coda', coda_rope: 'coda', coda_ce: 'coda',
+               liger_rms: 'liger_kernel.ops.rms_norm', liger_rope: 'liger_kernel.ops.rope',
+               liger_ce: 'liger_kernel.ops.fused_linear_cross_entropy',
+               liger_ce_unfused: 'liger_kernel.ops.cross_entropy',
+               flashinfer_rms: 'flashinfer.norm', flashinfer_rope: 'flashinfer.rope',
+               quack_rms: 'quack.linear', quack_rope: 'quack.linear', quack_ce: 'quack.linear'}
+    if fn in modules:
+        try:
+            import_module(modules[fn])
+        except ImportError:
+            pass
+    if fn is flashinfer_rope:
+        import math
+        x, w, cos, sin, _ = args
+        H = math.gcd(w.shape[-1], 128)
+        cache = (torch.arange(x.shape[1], device=x.device).repeat(x.shape[0]),
+                 torch.cat((cos[:, :H // 2], sin[:, :H // 2]), -1).float().contiguous())
+        prepared = partial(fn, cache=cache)
+    elif fn is liger_rope:
+        import math
+        H = math.gcd(args[1].shape[-1], 128)
+        cache = tuple(t[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous() for t in args[2:4])
+        prepared = partial(fn, cache=cache)
+    else:
+        prepared = fn
+    prepared.modes = getattr(fn, 'modes', ('fwd', 'bwd', 'fwd+bwd'))
+    prepared.configs = getattr(fn, 'configs', lambda: '')
+    return prepared
 
 
 def _quack_mm(x, w):
-    if torch.cuda.get_device_capability()[0] < 9:
-        raise NotImplementedError('QuACK requires SM90+')
+    if not torch.compiler.is_compiling() and torch.cuda.get_device_capability()[0] < 8:
+        raise NotImplementedError('QuACK requires SM80+')
     if x.dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError('QuACK requires FP16/BF16 inputs')
-    from quack.gemm_interface import gemm
-    return gemm(x.reshape(-1, x.shape[-1]), w).reshape(*x.shape[:-1], w.shape[-1])
+    from quack.linear import linear_func
+    return linear_func(x, w.T)
 
 
 def quack_rms(x, w, z, gamma, w2, eps):
     h = _quack_mm(x, w) + z
-    return _quack_mm(torch.nn.functional.rms_norm(h, (h.shape[-1],), gamma, eps), w2)
+    return _quack_mm(torch.nn.functional.rms_norm(h.float(), (h.shape[-1],), gamma.float(), eps).to(x.dtype), w2)
 
 
 def quack_rope(x, w, cos, sin, w2):
@@ -369,7 +420,7 @@ coda_rope.configs = lambda: _configs('gemm_rope_tuned', 'gemm_tuned')
 coda_ce.configs = lambda: _configs('gemm_CE_tuned')
 
 
-for _fn in (liger_ce, quack_rms, quack_rope, quack_ce):
+for _fn in (liger_ce, flashinfer_rms, flashinfer_rope):
     _fn.modes = ('fwd',)
 
 
