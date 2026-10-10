@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+/qudata
+/qudata.pub
+/results/*.html
+/results/*.csv
+!/results/bench_20261010_192137.csv
+/results/test_h100_executed.ipynb
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
