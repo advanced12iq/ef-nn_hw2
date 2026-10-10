@@ -1,15 +1,4 @@
 import torch
-import triton
-
-from coda import GemmResRmsGemm, GemmResRmsGemm2, GemmRope
-from kernels import (
-    backward_gemm_rms_res_kernel,
-    finish_gemm_res_rms_kernel,
-    gemm_kernel,
-    gemm_res_rms_kernel,
-    rms_norm_kernel,
-)
-from utils import launch_visualizer
 
 SHARED_MEMORY_SIZE = 64*1024
 
@@ -17,19 +6,23 @@ SHARED_MEMORY_SIZE = 64*1024
 def gemm(a: torch.Tensor, b: torch.Tensor, 
     M_TILE_SIZE: int = 32, K_TILE_SIZE: int = 32
 ):
+    import triton
+    from kernels import gemm_kernel
+    if b.ndim == 3:
+        assert a.shape[0] == b.shape[0]
+        return torch.cat([gemm(a[i:i+1], b[i], M_TILE_SIZE, K_TILE_SIZE) for i in range(a.shape[0])])
     B, M, N = a.shape
-    B2, N2, K = b.shape
-    assert B == B2
+    N2, K = b.shape
     assert N == N2
 
-    o = torch.empty((B, M, K))
+    o = torch.empty((B, M, K), device=a.device, dtype=a.dtype)
 
     N_TILE_SIZE = 16
 
-    gemm_kernel[B, triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE)](  #256//32 * 64//32 == 8 * 2
+    gemm_kernel[triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE), B](  #256//32 * 64//32 == 8 * 2
         a, b, o,
         a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
+        b.stride(0),
         o.stride(0), o.stride(1),
         M, N, K,
         M_TILE_SIZE=M_TILE_SIZE, 
@@ -41,6 +34,8 @@ def gemm(a: torch.Tensor, b: torch.Tensor,
 
 
 def my_rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
+    import triton
+    from kernels import rms_norm_kernel
     B, N, M = x.shape
     o = torch.empty_like(x)
     rms_norm_kernel[B, N](
@@ -56,20 +51,26 @@ def gem_res_rms(
     a, b, res, 
     M_TILE_SIZE: int = 32, K_TILE_SIZE: int = 32, 
 ):
+    import triton
+    from kernels import gemm_res_rms_kernel
+    if b.ndim == 3:
+        assert a.shape[0] == b.shape[0]
+        pairs = [gem_res_rms(a[i:i+1], b[i], res[i:i+1], M_TILE_SIZE, K_TILE_SIZE) for i in range(a.shape[0])]
+        return tuple(torch.cat(items) for items in zip(*pairs))
     B, M, N = a.shape
-    B2, N2, K = b.shape
-    assert B == B2
+    N2, K = b.shape
     assert N == N2
 
-    o = torch.empty((B, M, K))
-    partial = torch.empty((B, M, triton.cdiv(K, K_TILE_SIZE)), dtype=torch.float32)
+    o = torch.empty((B, M, K), device=a.device, dtype=a.dtype)
+    partial = torch.empty((B, M, triton.cdiv(K, K_TILE_SIZE)), device=a.device, dtype=torch.float32)
+    h0 = torch.empty_like(o)
 
     N_TILE_SIZE = 16
 
-    gemm_res_rms_kernel[B, triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE)](  #256//32 * 64//32 == 8 * 2
-        a, b, o, partial, res,
+    gemm_res_rms_kernel[triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE), B](  #256//32 * 64//32 == 8 * 2
+        a, b, o, h0, partial, res,
         a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
+        b.stride(0),
         o.stride(0), o.stride(1),
         partial.stride(0), partial.stride(1),
         M, N, K,
@@ -82,19 +83,23 @@ def gem_res_rms(
 
 
 def finish_gemm_res_rms(a, partial, gamma, eps: float = 1e-6):
+    import triton
+    from kernels import finish_gemm_res_rms_kernel
     o = torch.empty_like(a)
 
     M, N = o.shape[1:]
     K = partial.shape[-1]
 
-    m2_dim = triton.next_power_of_2(M)
+    m2_dim = 1
+    reduced = torch.empty((*a.shape[:2], 1), device=a.device, dtype=torch.float32)
     n2_dim = triton.next_power_of_2(N)
     k2_dim = triton.next_power_of_2(K)
 
-    finish_gemm_res_rms_kernel[a.shape[0],](
-        a, partial, gamma, o,
+    finish_gemm_res_rms_kernel[a.shape[0], M](
+        a, partial, gamma, o, reduced,
         a.stride(0), a.stride(1),
         partial.stride(0), partial.stride(1),
+        reduced.stride(0),
         M, N, K,
         m2_dim, n2_dim, k2_dim,
         eps
@@ -130,7 +135,7 @@ def reference_gemm_res_rms_gemm(
 ):
     from torch.nn.functional import rms_norm
     after_res =x@weight1 + z
-    return rms_norm(after_res, after_res.shape[-1:], gamma, eps) @ weight2
+    return rms_norm(after_res.float(), after_res.shape[-1:], gamma.float(), eps).to(x.dtype) @ weight2
 
 
 def my_rope(
@@ -139,7 +144,8 @@ def my_rope(
     cos, sin
 ):
     h0 = x @ weight
-    x1, x2 = h0[..., ::2], h0[..., 1::2]
+    x1, x2 = h0[..., ::2].float(), h0[..., 1::2].float()
+    cos, sin = cos.float(), sin.float()
 
     out = torch.empty_like(h0)
     out[..., ::2] = cos[None, :]*x1 - sin[None, :]*x2
@@ -153,17 +159,17 @@ def gemm_rope(
     cos, sin,
     M_TILE_SIZE: int = 32, K_TILE_SIZE: int = 32, 
 ):
+    import triton
+    from kernels import gemm_rope_kernel
     B, M, N = x.shape
     N2, K = weight.shape
     assert N == N2
 
-    o = torch.empty((B, M, K), dtype=torch.float32)
+    o = torch.empty((B, M, K), device=x.device, dtype=x.dtype)
 
     N_TILE_SIZE = 16
 
-    from kernels import gemm_rope_kernel
-
-    gemm_rope_kernel[B, (triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE))](
+    gemm_rope_kernel[(triton.cdiv(M, M_TILE_SIZE) * triton.cdiv(K, K_TILE_SIZE)), B](
         x, weight, o,
         cos, sin,
         x.stride(0), x.stride(1),
@@ -212,13 +218,14 @@ def precompute_rope_cache(
 
 
 def gemm_CE(x, weight, y, M_TILE_SIZE = 16, K_TILE_SIZE = 16):
+    import triton
     B, M, N = x.shape
     K = weight.shape[-1]
-    output = torch.empty(x.shape[:2])
-    logsumexp_o = torch.empty(x.shape[:2])
+    output = torch.empty(x.shape[:2], device=x.device, dtype=torch.float32)
+    logsumexp_o = torch.empty_like(output)
     for b in range(x.shape[0]):
         for m in range(triton.cdiv(M, M_TILE_SIZE)):
-            max_logit = torch.full((min(M_TILE_SIZE, M - m*M_TILE_SIZE),), -1e9)
+            max_logit = torch.full((min(M_TILE_SIZE, M - m*M_TILE_SIZE),), -float("inf"), device=x.device)
             sum_exp = torch.zeros_like(max_logit, dtype=torch.float32)
             desired_logit = torch.zeros_like(max_logit, dtype=torch.float32)
             for k in range(triton.cdiv(K, K_TILE_SIZE)):
@@ -227,10 +234,11 @@ def gemm_CE(x, weight, y, M_TILE_SIZE = 16, K_TILE_SIZE = 16):
                 new_max_logit = torch.maximum(max_logit, torch.amax(S, dim=-1))
                 sum_exp = torch.exp(max_logit - new_max_logit)*sum_exp + \
                     torch.exp(S - new_max_logit[:, None]).sum(dim=-1)
-                desired_logit = torch.exp(max_logit - new_max_logit) * desired_logit + \
-                    torch.sum(torch.exp(S - new_max_logit[:, None])*y[b, m*M_TILE_SIZE:(m+1)*M_TILE_SIZE, k*K_TILE_SIZE:(k+1)*K_TILE_SIZE], dim=-1)
+                labels = y[b, m*M_TILE_SIZE:(m+1)*M_TILE_SIZE]
+                columns = torch.arange(k*K_TILE_SIZE, min((k+1)*K_TILE_SIZE, K), device=x.device)
+                desired_logit += torch.where(labels[:, None] == columns, S.float(), 0).sum(-1)
                 max_logit = new_max_logit
-            output[b, m*M_TILE_SIZE:(m+1)*M_TILE_SIZE] = desired_logit / sum_exp
+            output[b, m*M_TILE_SIZE:(m+1)*M_TILE_SIZE] = max_logit + torch.log(sum_exp) - desired_logit
             logsumexp_o[b, m*M_TILE_SIZE:(m+1)*M_TILE_SIZE] = max_logit + torch.log(sum_exp)
 
     return output, logsumexp_o
@@ -238,11 +246,15 @@ def gemm_CE(x, weight, y, M_TILE_SIZE = 16, K_TILE_SIZE = 16):
 def reference_gemm_CE(x, weight, y):
     from torch.nn.functional import cross_entropy
     return cross_entropy(
-        (x @ weight).transpose(1, 2),
+        (x @ weight).float().transpose(1, 2),
         y,
         reduction="none",
     )
 
+
+
+def reference_gemm_rope(x, weight, cos, sin, weight2):
+    return my_rope(x, weight, cos, sin) @ weight2
 
 def main():
     from coda import GemmCE
@@ -265,6 +277,100 @@ def main():
 
     print("GEMM + CE forward and backward match PyTorch")
     # launch_visualizer()
+
+
+def coda_rms(*args):
+    from coda import GemmResRmsGemm2
+    return GemmResRmsGemm2.apply(*args)
+
+
+def coda_rope(*args):
+    from coda import GemmRope
+    return GemmRope.apply(*args)
+
+
+def coda_ce(*args):
+    from coda import GemmCE
+    return GemmCE.apply(*args)
+
+
+def liger_rms(x, w, z, gamma, w2, eps):
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+    return LigerRMSNormFunction.apply(x @ w + z, gamma, eps, 0.0, 'gemma', False, None) @ w2
+
+
+def liger_rope(x, w, cos, sin, w2):
+    import math
+    from liger_kernel.ops.rope import LigerRopeFunction
+    h = x @ w
+    B, M, K = h.shape
+    H = math.gcd(K, 128)
+    h = h.reshape(B, M, K // H, H)
+    q = torch.cat((h[..., ::2], h[..., 1::2]), -1).transpose(1, 2).contiguous()
+    c, s = cos[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous(), sin[:, :H // 2].float().repeat(1, 2).unsqueeze(0).contiguous()
+    a, b = LigerRopeFunction.apply(q.clone(), q.clone(), c, s, None, 1)
+    h = ((a + b) * 0.5).transpose(1, 2)
+    return torch.stack((h[..., :H // 2], h[..., H // 2:]), -1).reshape(B, M, K) @ w2
+
+
+def liger_ce(x, w, labels):
+    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+    loss = LigerFusedLinearCrossEntropyFunction.apply(
+        x.flatten(0, 1), w.T.contiguous(), labels.flatten(), None, None, -100, 0.0, 0.0,
+        'none', None, False, torch.float32, False, False, False)
+    return (loss[0] if isinstance(loss, tuple) else loss).reshape(labels.shape)
+
+
+def flash_rope(x, w, cos, sin, w2):
+    import math
+    from flash_attn.layers.rotary import apply_rotary_emb
+    h = x @ w
+    B, M, K = h.shape
+    H = math.gcd(K, 128)
+    h = apply_rotary_emb(h.reshape(B, M, K // H, H), cos[:, :H // 2].contiguous(),
+                         sin[:, :H // 2].contiguous(), interleaved=True)
+    return h.reshape(B, M, K) @ w2
+
+
+def _quack_mm(x, w):
+    if torch.cuda.get_device_capability()[0] < 9:
+        raise NotImplementedError('QuACK requires SM90+')
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError('QuACK requires FP16/BF16 inputs')
+    from quack.gemm_interface import gemm
+    return gemm(x.reshape(-1, x.shape[-1]), w).reshape(*x.shape[:-1], w.shape[-1])
+
+
+def quack_rms(x, w, z, gamma, w2, eps):
+    h = _quack_mm(x, w) + z
+    return _quack_mm(torch.nn.functional.rms_norm(h, (h.shape[-1],), gamma, eps), w2)
+
+
+def quack_rope(x, w, cos, sin, w2):
+    h = _quack_mm(x, w).float()
+    cos, sin = cos.float(), sin.float()
+    h = torch.stack((h[..., ::2] * cos - h[..., 1::2] * sin,
+                     h[..., ::2] * sin + h[..., 1::2] * cos), -1).flatten(-2).to(x.dtype)
+    return _quack_mm(h, w2)
+
+
+def quack_ce(x, w, labels):
+    return torch.nn.functional.cross_entropy(_quack_mm(x, w).float().transpose(1, 2), labels, reduction='none')
+
+
+def _configs(*names):
+    import kernels
+    return '; '.join(f'{name}: {kernel.best_config}' for name in names
+                     if hasattr(kernel := getattr(kernels, name), 'best_config'))
+
+
+coda_rms.configs = lambda: _configs('gemm_res_rms_tuned', 'gemm_tuned', 'backward_gemm_rms_res_tuned')
+coda_rope.configs = lambda: _configs('gemm_rope_tuned', 'gemm_tuned')
+coda_ce.configs = lambda: _configs('gemm_CE_tuned')
+
+
+for _fn in (liger_ce, quack_rms, quack_rope, quack_ce):
+    _fn.modes = ('fwd',)
 
 
 if __name__ == "__main__":
